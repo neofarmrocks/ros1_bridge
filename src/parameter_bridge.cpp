@@ -16,6 +16,7 @@
 
 #include <list>
 #include <string>
+#include <thread>
 
 // include ROS 1
 #ifdef __clang__
@@ -240,6 +241,8 @@ int main(int argc, char * argv[])
   auto ros2_node = rclcpp::Node::make_shared("ros_bridge");
 
   std::list<ros1_bridge::BridgeHandles> all_handles;
+  std::list<ros1_bridge::Bridge1to2Handles> all_handles_1_to_2;
+  std::list<ros1_bridge::Bridge2to1Handles> all_handles_2_to_1;
   std::list<ros1_bridge::ServiceBridge1to2> service_bridges_1_to_2;
   std::list<ros1_bridge::ServiceBridge2to1> service_bridges_2_to_1;
 
@@ -281,13 +284,43 @@ int main(int argc, char * argv[])
       if (!queue_size) {
         queue_size = 100;
       }
+      std::string direction = "both";
+      if (topics[i].hasMember("direction")) {
+        direction = static_cast<std::string>(topics[i]["direction"]);
+      }
       printf(
-        "Trying to create bidirectional bridge for topic '%s' "
+        "Trying to create [%s] bridge for topic '%s' "
         "with ROS 2 type '%s'\n",
-        topic_name.c_str(), type_name.c_str());
+        direction.c_str(), topic_name.c_str(), type_name.c_str());
 
       try {
-        if (topics[i].hasMember("qos")) {
+        if (direction == "2_to_1") {
+          if (topics[i].hasMember("qos")) {
+            printf("Setting up QoS for '%s': ", topic_name.c_str());
+            auto qos_settings = qos_from_params(topics[i]["qos"]);
+            printf("\n");
+            all_handles_2_to_1.push_back(ros1_bridge::create_bridge_from_2_to_1(
+                ros2_node, ros1_node, type_name, topic_name, qos_settings,
+                "", topic_name, queue_size));
+          } else {
+            all_handles_2_to_1.push_back(ros1_bridge::create_bridge_from_2_to_1(
+                ros2_node, ros1_node, type_name, topic_name, queue_size,
+                "", topic_name, queue_size));
+          }
+        } else if (direction == "1_to_2") {
+          if (topics[i].hasMember("qos")) {
+            printf("Setting up QoS for '%s': ", topic_name.c_str());
+            auto qos_settings = qos_from_params(topics[i]["qos"]);
+            printf("\n");
+            all_handles_1_to_2.push_back(ros1_bridge::create_bridge_from_1_to_2(
+                ros1_node, ros2_node, "", topic_name, queue_size,
+                type_name, topic_name, qos_settings));
+          } else {
+            all_handles_1_to_2.push_back(ros1_bridge::create_bridge_from_1_to_2(
+                ros1_node, ros2_node, "", topic_name, queue_size,
+                type_name, topic_name, queue_size));
+          }
+        } else if (topics[i].hasMember("qos")) {
           printf("Setting up QoS for '%s': ", topic_name.c_str());
           auto qos_settings = qos_from_params(topics[i]["qos"]);
           printf("\n");
@@ -445,10 +478,16 @@ int main(int argc, char * argv[])
   async_spinner.start();
 
   // ROS 2 spinning loop
-  rclcpp::executors::SingleThreadedExecutor executor;
-  while (ros1_node.ok() && rclcpp::ok()) {
-    executor.spin_node_once(ros2_node, std::chrono::milliseconds(1000));
-  }
+  rclcpp::executors::MultiThreadedExecutor executor;
+  executor.add_node(ros2_node);
+  std::thread ros1_watchdog([&executor, &ros1_node]() {
+      while (ros1_node.ok() && rclcpp::ok()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      }
+      executor.cancel();
+    });
+  executor.spin();
+  ros1_watchdog.join();
 
   return 0;
 }
