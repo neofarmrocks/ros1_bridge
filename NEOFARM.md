@@ -50,6 +50,14 @@ Each is load-bearing for the one-rosmaster-per-machine topology
    a single-direction bridge instead. `service_execution_timeout` is
    read from `ros1_bridge/parameter_bridge/service_execution_timeout`
    (set by `docker/run_parameter_bridge.sh`).
+5. **Executor survives forward exceptions** (`src/parameter_bridge.cpp`).
+   A failed LOCAL ROS 1 service call inside `forward_2_to_1` throws; the
+   exception escapes `executor.spin()` and terminates the whole bridge
+   process (observed live: greenhouse bridge died on
+   `Failed to get response from ROS 1 service /api/action/get`). The spin
+   is wrapped in a catch-and-continue loop — the unanswered ROS 2 request
+   times out on the caller side (the `b''` semantics callers already
+   handle) and every other relay keeps running.
 
 ## Updating
 

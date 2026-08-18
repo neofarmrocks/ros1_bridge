@@ -486,7 +486,16 @@ int main(int argc, char * argv[])
       }
       executor.cancel();
     });
-  executor.spin();
+  while (ros1_node.ok() && rclcpp::ok()) {
+    try {
+      executor.spin();
+    } catch (const std::exception & e) {
+      // A failed local ROS 1 service call inside a forward throws (see
+      // ServiceFactory::forward_2_to_1); the unanswered ROS 2 request times
+      // out on the caller side. Never let it take the relay process down.
+      fprintf(stderr, "executor exception (bridge kept alive): %s\n", e.what());
+    }
+  }
   ros1_watchdog.join();
 
   return 0;
