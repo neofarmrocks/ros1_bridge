@@ -418,8 +418,8 @@ public:
     int service_execution_timeout)
   {
     // roscpp's client.call() blocks with no deadline: a ROS 1 server that
-    // accepted the connection and never answers (every rospy node on the
-    // island does exactly that while /clock is missing) would park whatever
+    // accepted the connection and never answers (a rospy node waiting on sim
+    // time does exactly that while /clock is missing) would park whatever
     // thread called it forever. So it must not run on an executor thread at
     // all -- park it on a detached worker, which sends the response itself,
     // and return immediately so the relay callbacks keep their threads no

@@ -320,8 +320,9 @@ void update_bridge(
         "ros1", details.at("package"), details.at("name"));
       if (factory) {
         try {
-          // NeoFarm runs parameter_bridge; dynamic_bridge keeps upstream's
-          // 5 s budget and the node's default callback group.
+          // Upstream defaults: the 5 s budget dynamic_bridge always used, and
+          // the node's default callback group. Only parameter_bridge makes
+          // these configurable.
           service_bridges_2_to_1[name] = factory->service_bridge_2_to_1(
             ros1_node, ros2_node, name, 5, nullptr);
           printf("Created 2 to 1 bridge for service %s\n", name.data());

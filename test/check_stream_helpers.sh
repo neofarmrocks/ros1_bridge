@@ -9,9 +9,11 @@
 # bounds-checking advance() moves back after the element-wise copy, which is an
 # out-of-bounds read of attacker-controlled length on the receive path.
 #
-# Needs ROS 1 headers (roscpp_serialization) and a compiler with AddressSanitizer.
-# Run it inside the build image, e.g.
-#   docker run --rm -v "$PWD":/src:ro local/kilted_noetic_noble /src/test/check_stream_helpers.sh
+# Needs ROS 1 headers (roscpp_serialization) and a compiler with AddressSanitizer,
+# so run it wherever this package is built:
+#   test/check_stream_helpers.sh
+# Set ROS1_INSTALL_PATH if the ROS 1 install is somewhere other than
+# /opt/ros/one or /opt/ros/noetic.
 
 set -euo pipefail
 
