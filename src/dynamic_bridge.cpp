@@ -318,7 +318,10 @@ void update_bridge(
         "ros1", details.at("package"), details.at("name"));
       if (factory) {
         try {
-          service_bridges_2_to_1[name] = factory->service_bridge_2_to_1(ros1_node, ros2_node, name);
+          // NeoFarm runs parameter_bridge; dynamic_bridge keeps upstream's
+          // 5 s budget and the node's default callback group.
+          service_bridges_2_to_1[name] = factory->service_bridge_2_to_1(
+            ros1_node, ros2_node, name, 5, nullptr);
           printf("Created 2 to 1 bridge for service %s\n", name.data());
         } catch (std::runtime_error & e) {
           fprintf(stderr, "Failed to created a bridge: %s\n", e.what());

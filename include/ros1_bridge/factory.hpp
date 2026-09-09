@@ -16,7 +16,9 @@
 #define  ROS1_BRIDGE__FACTORY_HPP_
 
 #include <functional>
+#include <future>
 #include <memory>
+#include <thread>
 #include <string>
 #include <utility>
 #include <vector>
@@ -403,15 +405,40 @@ public:
 
   void forward_2_to_1(
     ros::ServiceClient client, rclcpp::Logger logger, const std::shared_ptr<rmw_request_id_t>,
-    const std::shared_ptr<ROS2Request> request, std::shared_ptr<ROS2Response> response)
+    const std::shared_ptr<ROS2Request> request, std::shared_ptr<ROS2Response> response,
+    int service_execution_timeout)
   {
-    ROS1_T srv;
-    translate_2_to_1(*request, srv.request);
-    if (client.call(srv)) {
-      translate_1_to_2(srv.response, *response);
-    } else {
+    // roscpp's client.call() blocks with no deadline: a ROS 1 server that
+    // accepted the connection and never answers (every rospy node on the
+    // island does exactly that while /clock is missing) would park this
+    // callback forever. Do the call on a detached worker and give up on it
+    // after the same budget forward_1_to_2 uses. The worker keeps the request
+    // alive and unwinds on its own once ROS 1 answers or the peer dies; we
+    // deliberately do not join it, because the call cannot be cancelled.
+    // Ceiling: one leaked thread per timed-out call, so a caller that retries
+    // against a wedged server accumulates them. Acceptable only while the
+    // retry rates are the seconds-apart ones we have; a bounded worker pool
+    // or a roscpp-level cancel is the upgrade path.
+    auto srv = std::make_shared<ROS1_T>();
+    translate_2_to_1(*request, srv->request);
+    auto called = std::make_shared<std::promise<bool>>();
+    auto result = called->get_future();
+    std::thread(
+      [client, srv, called]() mutable {
+        called->set_value(client.call(*srv));
+      }).detach();
+
+    if (result.wait_for(std::chrono::seconds(service_execution_timeout)) !=
+      std::future_status::ready)
+    {
+      throw std::runtime_error(
+        "Timed out after " + std::to_string(service_execution_timeout) +
+        "s waiting for ROS 1 service " + client.getService());
+    }
+    if (!result.get()) {
       throw std::runtime_error("Failed to get response from ROS 1 service " + client.getService());
     }
+    translate_1_to_2(srv->response, *response);
   }
 
   bool forward_1_to_2(
@@ -464,7 +491,8 @@ public:
   }
 
   ServiceBridge2to1 service_bridge_2_to_1(
-    ros::NodeHandle & ros1_node, rclcpp::Node::SharedPtr ros2_node, const std::string & name)
+    ros::NodeHandle & ros1_node, rclcpp::Node::SharedPtr ros2_node, const std::string & name,
+    int service_execution_timeout, rclcpp::CallbackGroup::SharedPtr group)
   {
     ServiceBridge2to1 bridge;
     bridge.client = ros1_node.serviceClient<ROS1_T>(name);
@@ -474,10 +502,25 @@ public:
         const std::shared_ptr<rmw_request_id_t>,
         const std::shared_ptr<ROS2Request>,
         std::shared_ptr<ROS2Response>)> f;
-    f = std::bind(
-      m, this, bridge.client, ros2_node->get_logger(), std::placeholders::_1,
-      std::placeholders::_2, std::placeholders::_3);
-    bridge.server = ros2_node->create_service<ROS2_T>(name, f);
+    // The forward throws when ROS 1 fails or misses the deadline. It now runs
+    // on an executor WORKER thread (own callback group), where an escaping
+    // exception is std::terminate — the catch around executor.spin() only
+    // covers the spinning thread. Contain it here and leave the ROS 2 request
+    // unanswered, which is the `b''` timeout the callers already handle.
+    auto logger = ros2_node->get_logger();
+    auto client = bridge.client;
+    f = [this, m, client, logger, service_execution_timeout](
+      const std::shared_ptr<rmw_request_id_t> request_id,
+      const std::shared_ptr<ROS2Request> request,
+      std::shared_ptr<ROS2Response> response) {
+        try {
+          (this->*m)(client, logger, request_id, request, response, service_execution_timeout);
+        } catch (const std::exception & e) {
+          RCLCPP_ERROR(logger, "2->1 forward failed, request left unanswered: %s", e.what());
+        }
+      };
+    bridge.server = ros2_node->create_service<ROS2_T>(
+      name, f, rclcpp::ServicesQoS(), group);
     return bridge;
   }
 
