@@ -346,15 +346,24 @@ int main(int argc, char * argv[])
       "The parameter '%s' either doesn't exist or isn't an array\n", topics_parameter_name);
   }
 
+  // Shared by both service directions (the 2->1 loop below needs it too).
+  int service_execution_timeout{5};
+  ros1_node.getParamCached(
+    service_execution_timeout_parameter_name, service_execution_timeout);
+
+  // 2->1 forwards call into ROS 1 and can block for their whole timeout.
+  // Keep them off the node's default (mutually exclusive) callback group, or a
+  // single unanswered call stops every other callback of this node — the
+  // /clock relay included, which stalls sim time for the whole island.
+  auto service_callback_group = ros2_node->create_callback_group(
+    rclcpp::CallbackGroupType::Reentrant);
+
   // ROS 1 Services in ROS 2
   XmlRpc::XmlRpcValue services_1_to_2;
   if (
     ros1_node.getParam(services_1_to_2_parameter_name, services_1_to_2) &&
     services_1_to_2.getType() == XmlRpc::XmlRpcValue::TypeArray)
   {
-    int service_execution_timeout{5};
-    ros1_node.getParamCached(
-      service_execution_timeout_parameter_name, service_execution_timeout);
     for (size_t i = 0; i < static_cast<size_t>(services_1_to_2.size()); ++i) {
       std::string service_name = static_cast<std::string>(services_1_to_2[i]["service"]);
       std::string type_name = static_cast<std::string>(services_1_to_2[i]["type"]);
@@ -450,7 +459,9 @@ int main(int argc, char * argv[])
       if (factory) {
         try {
           service_bridges_2_to_1.push_back(
-            factory->service_bridge_2_to_1(ros1_node, ros2_node, service_name));
+            factory->service_bridge_2_to_1(
+              ros1_node, ros2_node, service_name, service_execution_timeout,
+              service_callback_group));
           printf("Created 2 to 1 bridge for service %s\n", service_name.c_str());
         } catch (std::runtime_error & e) {
           fprintf(
