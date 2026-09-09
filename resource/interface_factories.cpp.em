@@ -306,13 +306,14 @@ void ServiceFactory<
 @[      for field in service["fields"][type.lower()]]@
 @[        if field["array"]]@
   req@(to).@(field["ros" + to]["name"]).resize(req@(frm).@(field["ros" + frm]["name"]).size());
-  for ( size_t i = 0; i < req1.@(field["ros1"]["name"]).size(); ++i)
+  for (size_t i = 0; i < req@(frm).@(field["ros" + frm]["name"]).size(); ++i) {
 @[          if field["basic"]]@
     req@(to).@(field["ros" + to]["name"])[i] = req@(frm).@(field["ros" + frm]["name"])[i];
 @[          else]@
     Factory<@(field["ros1"]["cpptype"]),@(field["ros2"]["cpptype"])>::convert_@(frm)_to_@(to)(@
 req@(frm).@(field["ros" + frm]["name"])[i], req@(to).@(field["ros" + to]["name"])[i]);
 @[          end if]@
+  }
 @[        elif field["basic"]]@
   req@(to).@(field["ros" + to]["name"]) = req@(frm).@(field["ros" + frm]["name"]);
 @[        else]@
@@ -366,10 +367,13 @@ static void streamPrimitiveVectorBool(ros::serialization::OStream & stream, cons
 {
   const uint32_t step = sizeof(bool);
   const uint32_t data_len = vec.size() * sizeof(bool);
-  // element-wise copy because of vector<bool>
-  for(uint i = 0; i < vec.size(); ++i)
-    *(stream.getData()+i*step) = vec[i];
-  stream.advance(data_len);
+  // advance() is what bounds-checks the buffer, so it has to run before the
+  // copy: writing through getData() first would overflow the buffer instead of
+  // throwing StreamOverrunException. Element-wise copy because of vector<bool>.
+  uint8_t * dst = stream.advance(data_len);
+  for (size_t i = 0; i < vec.size(); ++i) {
+    dst[i * step] = vec[i];
+  }
 }
 
 // This version is for length
@@ -397,16 +401,21 @@ static void streamPrimitiveVector(ros::serialization::IStream & stream, VEC_PRIM
   memcpy(&vec.front(), stream.advance(data_len), data_len);
 }
 
-// This version is for read sector<bool>
+// This version is for read vector<bool>
 template<typename VEC_PRIMITIVE_T>
 static void streamPrimitiveVectorBool(ros::serialization::IStream & stream, VEC_PRIMITIVE_T& vec)
 {
   const uint32_t step = sizeof(bool);
   const uint32_t data_len = vec.size() * sizeof(bool);
-  // element-wise copy because of vector<bool>
-  for(uint i = 0; i < vec.size(); ++i)
-    vec[i] = *(stream.getData() + i*step);
-  stream.advance(data_len);
+  // advance() is what bounds-checks the read, so it has to run before the
+  // copy: vec.size() comes straight off the wire (streamVectorSize resized the
+  // vector from the message), so a truncated message would otherwise be read
+  // past the end of the receive buffer before the check ever runs.
+  // Element-wise copy because of vector<bool>.
+  const uint8_t * src = stream.advance(data_len);
+  for (size_t i = 0; i < vec.size(); ++i) {
+    vec[i] = src[i * step] != 0;
+  }
 }
 
 @[for m in mapped_msgs]@

@@ -14,6 +14,8 @@
 
 #include <xmlrpcpp/XmlRpcException.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <list>
 #include <string>
 #include <thread>
@@ -287,6 +289,15 @@ int main(int argc, char * argv[])
       std::string direction = "both";
       if (topics[i].hasMember("direction")) {
         direction = static_cast<std::string>(topics[i]["direction"]);
+        if (direction != "both" && direction != "1_to_2" && direction != "2_to_1") {
+          fprintf(
+            stderr,
+            "the topic '%s' has an unknown 'direction' value '%s', allowed values are 'both', "
+            "'1_to_2' and '2_to_1' - skipping it, because falling back to a bidirectional "
+            "bridge would relay the direction the configuration meant to exclude\n",
+            topic_name.c_str(), direction.c_str());
+          continue;
+        }
       }
       printf(
         "Trying to create [%s] bridge for topic '%s' "
@@ -335,9 +346,9 @@ int main(int argc, char * argv[])
       } catch (std::runtime_error & e) {
         fprintf(
           stderr,
-          "failed to create bidirectional bridge for topic '%s' "
+          "failed to create [%s] bridge for topic '%s' "
           "with ROS 2 type '%s': %s\n",
-          topic_name.c_str(), type_name.c_str(), e.what());
+          direction.c_str(), topic_name.c_str(), type_name.c_str(), e.what());
       }
     }
   } else {
@@ -350,11 +361,19 @@ int main(int argc, char * argv[])
   int service_execution_timeout{5};
   ros1_node.getParamCached(
     service_execution_timeout_parameter_name, service_execution_timeout);
+  if (service_execution_timeout < 1) {
+    fprintf(
+      stderr,
+      "'%s' is %d, which would fail every service forward before it starts; using 1s\n",
+      service_execution_timeout_parameter_name, service_execution_timeout);
+    service_execution_timeout = 1;
+  }
 
-  // 2->1 forwards call into ROS 1 and can block for their whole timeout.
-  // Keep them off the node's default (mutually exclusive) callback group, or a
-  // single unanswered call stops every other callback of this node — the
-  // /clock relay included, which stalls sim time for the whole island.
+  // Give the 2->1 servers a group of their own, so a slow request translation
+  // cannot serialize behind the topic relays in the node's default (mutually
+  // exclusive) group. The blocking part of the forward -- roscpp's untimed
+  // client.call() -- is already off the executor entirely (see
+  // ServiceFactory::forward_2_to_1); this is the second line of defence.
   auto service_callback_group = ros2_node->create_callback_group(
     rclcpp::CallbackGroupType::Reentrant);
 
@@ -497,17 +516,24 @@ int main(int argc, char * argv[])
       }
       executor.cancel();
     });
-  while (ros1_node.ok() && rclcpp::ok()) {
-    try {
-      executor.spin();
-    } catch (const std::exception & e) {
-      // A failed local ROS 1 service call inside a forward throws (see
-      // ServiceFactory::forward_2_to_1); the unanswered ROS 2 request times
-      // out on the caller side. Never let it take the relay process down.
-      fprintf(stderr, "executor exception (bridge kept alive): %s\n", e.what());
-    }
-  }
+  // The watchdog above is the only way out: spin() blocks on an idle wait set,
+  // so it has to be cancel()ed rather than polled. Nothing is caught around it
+  // on purpose - a MultiThreadedExecutor runs callbacks on worker threads,
+  // where an escaping exception is std::terminate before any catch here could
+  // see it. Failures in the forwards are contained where they happen instead.
+  executor.spin();
   ros1_watchdog.join();
 
-  return 0;
+  // A 2->1 forward worker can still be parked inside roscpp's client.call(),
+  // which cannot be cancelled. Dropping the ROS 1 connections releases the
+  // ones whose peer is only slow; the rest are left where they are and the
+  // process leaves without running static destruction, because a worker still
+  // inside call() would otherwise be using roscpp singletons as they are torn
+  // down under it.
+  async_spinner.stop();
+  ros::shutdown();
+  rclcpp::shutdown();
+  fflush(stdout);
+  fflush(stderr);
+  std::_Exit(0);
 }

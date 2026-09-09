@@ -517,3 +517,21 @@ topics:
 ```
 
 Note that the `qos` section can be omitted entirely and options not set are left default.
+
+### Bridging a topic in one direction only
+
+By default every entry in `topics` creates a bidirectional bridge.
+Where a topic has a single authority this is not what you want: with one ROS 1 master per machine and `/clock` published by one of them, the return direction gives the ROS 2 graph one bridge publisher of `/clock` per machine, all competing with the real authority.
+The optional `direction` key limits an entry to a single direction:
+
+```yaml
+topics:
+  -
+    topic: /clock
+    type: rosgraph_msgs/msg/Clock
+    queue_size: 1
+    direction: 1_to_2  # OR 2_to_1, OR both (the default)
+```
+
+`1_to_2` bridges ROS 1 -> ROS 2 only, `2_to_1` bridges ROS 2 -> ROS 1 only, and a `qos` section on the same entry applies to whichever single direction is created.
+An entry whose `direction` is none of these three values is skipped with an error on stderr, rather than falling back to a bidirectional bridge and relaying the direction the configuration meant to exclude.

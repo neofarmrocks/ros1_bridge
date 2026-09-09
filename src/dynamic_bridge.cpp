@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -801,5 +803,13 @@ int main(int argc, char * argv[])
     executor.spin_node_once(ros2_node);
   }
 
-  return 0;
+  // A 2->1 forward worker can still be parked inside roscpp's client.call(),
+  // which cannot be cancelled, so drop the ROS 1 connections and leave without
+  // running static destruction underneath it (see parameter_bridge.cpp).
+  async_spinner.stop();
+  ros::shutdown();
+  rclcpp::shutdown();
+  fflush(stdout);
+  fflush(stderr);
+  std::_Exit(0);
 }
