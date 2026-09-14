@@ -403,50 +403,38 @@ public:
   using ROS1Response = typename ROS1_T::Response;
   using ROS2Response = typename ROS2_T::Response;
 
-  // Deferred-response forward: rclcpp only sends a reply for the callback
-  // forms that return one, so this form is what actually leaves a failed
-  // request unanswered (the timeout semantics the callers handle). Returning a
-  // response object and reporting failure through an exception cannot work:
-  // rclcpp catches nothing here, and swallowing the throw at the callback
-  // would send a default-constructed reply -- success=false with no message,
-  // or empty data that reads as a successful empty answer.
+  // Deferred-response forward. Two things make this shape the only one that
+  // works: roscpp's client.call() blocks with no deadline, so it must not run
+  // on an executor thread at all (a rospy node waiting on sim time never
+  // answers while /clock is missing, and would park that thread forever), and
+  // rclcpp only withholds a reply for the callback forms that return none --
+  // returning a response object and reporting failure by exception would send
+  // a default-constructed reply instead, success=false with no message, or
+  // empty data that reads as a successful empty answer.
+  //
+  // So: park the call on a detached worker that sends the response itself, and
+  // return immediately, so the relay callbacks keep their threads no matter how
+  // many forwards are outstanding. A ROS 1 failure sends nothing, which is the
+  // timeout the callers already handle.
+  //
+  // Ceiling: one parked thread per call that ROS 1 never answers, because the
+  // call cannot be cancelled. Bounded in practice by the retry rate of the
+  // callers (seconds apart); a roscpp-level cancel or a bounded worker pool is
+  // the upgrade path. main() must not run static destruction while one of these
+  // is still inside client.call() -- see parameter_bridge.cpp.
   static void forward_2_to_1(
     ros::ServiceClient client, rclcpp::Logger logger,
     std::shared_ptr<rmw_request_id_t> request_id,
     const std::shared_ptr<ROS2Request> request,
-    std::shared_ptr<rclcpp::Service<ROS2_T>> service,
-    int service_execution_timeout)
+    std::shared_ptr<rclcpp::Service<ROS2_T>> service)
   {
-    // roscpp's client.call() blocks with no deadline: a ROS 1 server that
-    // accepted the connection and never answers (a rospy node waiting on sim
-    // time does exactly that while /clock is missing) would park whatever
-    // thread called it forever. So it must not run on an executor thread at
-    // all -- park it on a detached worker, which sends the response itself,
-    // and return immediately so the relay callbacks keep their threads no
-    // matter how many forwards are outstanding.
-    // Ceiling: one parked thread per call that ROS 1 never answers, because
-    // the call cannot be cancelled. Bounded in practice by the retry rate of
-    // the callers (seconds apart); a roscpp-level cancel or a bounded worker
-    // pool is the upgrade path. main() must not run static destruction while
-    // one of these is still inside client.call() -- see parameter_bridge.cpp.
     auto srv = std::make_shared<ROS1_T>();
     translate_2_to_1(*request, srv->request);
-    const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(service_execution_timeout);
     std::thread(
-      [client, srv, logger, service, request_id, deadline]() mutable {
-        const bool ok = client.call(*srv);
-        if (!ok) {
+      [client, srv, logger, service, request_id]() mutable {
+        if (!client.call(*srv)) {
           RCLCPP_ERROR(
             logger, "Failed to get response from ROS 1 service %s, request left unanswered",
-            client.getService().c_str());
-          return;
-        }
-        if (std::chrono::steady_clock::now() > deadline) {
-          // Past the budget the ROS 2 caller was given, so it has already
-          // given up. Sending now would answer a request nobody is waiting on.
-          RCLCPP_ERROR(
-            logger, "ROS 1 service %s answered after its deadline, dropping the response",
             client.getService().c_str());
           return;
         }
@@ -509,15 +497,12 @@ public:
 
   ServiceBridge2to1 service_bridge_2_to_1(
     ros::NodeHandle & ros1_node, rclcpp::Node::SharedPtr ros2_node, const std::string & name,
-    int service_execution_timeout, rclcpp::CallbackGroup::SharedPtr group)
+    rclcpp::CallbackGroup::SharedPtr group)
   {
     ServiceBridge2to1 bridge;
     bridge.client = ros1_node.serviceClient<ROS1_T>(name);
-    // The response-less callback forms are the ones rclcpp treats as "the
-    // callback will answer later": dispatch() returns no response for them, so
-    // nothing is sent until the forward's worker calls send_response(). This
-    // is the variant that also hands over the service handle, which is what
-    // the worker needs to answer with.
+    // This is the callback form that hands over the service handle, which is
+    // what the worker needs to answer with.
     auto logger = ros2_node->get_logger();
     auto client = bridge.client;
     std::function<
@@ -525,12 +510,11 @@ public:
         std::shared_ptr<rclcpp::Service<ROS2_T>>,
         std::shared_ptr<rmw_request_id_t>,
         std::shared_ptr<ROS2Request>)> f =
-      [client, logger, service_execution_timeout](
+      [client, logger](
       std::shared_ptr<rclcpp::Service<ROS2_T>> service,
       std::shared_ptr<rmw_request_id_t> request_id,
       std::shared_ptr<ROS2Request> request) {
-        forward_2_to_1(
-          client, logger, request_id, request, service, service_execution_timeout);
+        forward_2_to_1(client, logger, request_id, request, service);
       };
     bridge.server = ros2_node->create_service<ROS2_T>(
       name, f, rclcpp::ServicesQoS(), group);

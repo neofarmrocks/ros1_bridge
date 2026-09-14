@@ -141,15 +141,14 @@ public:
   virtual ServiceBridge1to2 service_bridge_1_to_2(
     ros::NodeHandle &, rclcpp::Node::SharedPtr, const std::string &, int) = 0;
 
-  // The timeout is the budget the ROS 2 caller is given: forward_2_to_1 calls
-  // into ROS 1 with roscpp's untimed client.call(), so a late answer is
-  // dropped rather than sent to a caller that has already given up. The
-  // callback group keeps request translation off the node's default (mutually
-  // exclusive) group, where it would serialize with the topic relays. Both are
+  // No timeout here, unlike 1->2: forward_2_to_1 answers from a detached
+  // worker, so nothing waits on ROS 1 for a budget to bound. The callback
+  // group keeps request translation off the node's default (mutually
+  // exclusive) group, where it would serialize with the topic relays. It is
   // passed explicitly at every call site - a virtual default argument would
   // resolve from the static type.
   virtual ServiceBridge2to1 service_bridge_2_to_1(
-    ros::NodeHandle &, rclcpp::Node::SharedPtr, const std::string &, int,
+    ros::NodeHandle &, rclcpp::Node::SharedPtr, const std::string &,
     rclcpp::CallbackGroup::SharedPtr) = 0;
 };
 

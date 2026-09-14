@@ -33,17 +33,10 @@
 
 namespace rs = ros::serialization;
 
-// 4-byte length prefix + one byte per element, which is what the generated
-// code writes: streamVectorSize() followed by streamPrimitiveVectorBool().
-static uint32_t wire_size(size_t elements)
-{
-  return static_cast<uint32_t>(4 + elements);
-}
-
 static void check_round_trip()
 {
   const std::vector<bool> in{true, false, true, true, false};
-  std::vector<uint8_t> buffer(wire_size(in.size()));
+  std::vector<uint8_t> buffer(4 + in.size());
 
   rs::OStream out(buffer.data(), static_cast<uint32_t>(buffer.size()));
   ros1_bridge::streamVectorSize(out, in);
@@ -85,7 +78,7 @@ static void check_truncated_read_throws()
 static void check_short_write_throws()
 {
   const std::vector<bool> in{true, true, true, true, true};
-  std::vector<uint8_t> buffer(wire_size(in.size()) - 2);
+  std::vector<uint8_t> buffer(4 + in.size() - 2);
 
   rs::OStream out(buffer.data(), static_cast<uint32_t>(buffer.size()));
   ros1_bridge::streamVectorSize(out, in);

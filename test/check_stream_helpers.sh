@@ -34,16 +34,10 @@ trap 'rm -rf "$WORK"' EXIT
 
 # The serialization helpers are the one region of the template with no empy
 # markup in it: from the "ROS1 serialization functions" comment up to the loop
-# that starts generating per-message code.
-START=$(grep -n '^// ROS1 serialization functions$' "$TEMPLATE" | cut -d: -f1)
-END=$(awk -v s="$START" 'NR > s && /^@\[for m in mapped_msgs\]@$/ {print NR; exit}' "$TEMPLATE")
-[ -n "$START" ] && [ -n "$END" ] || { echo "FAIL: cannot find the helper region in $TEMPLATE"; exit 2; }
-
-sed -n "$((START + 1)),$((END - 1))p" "$TEMPLATE" > "$WORK/stream_helpers.inc"
-if grep -q '@' "$WORK/stream_helpers.inc"; then
-  echo "FAIL: extracted region contains empy markup, the template layout changed"
-  exit 2
-fi
+# that starts generating per-message code. Drop both delimiter lines.
+sed -n '/^\/\/ ROS1 serialization functions$/,/^@\[for m in mapped_msgs\]@$/p' "$TEMPLATE" |
+  tail -n +2 | head -n -1 > "$WORK/stream_helpers.inc"
+[ -s "$WORK/stream_helpers.inc" ] || { echo "FAIL: helper region not found in $TEMPLATE"; exit 2; }
 # The region opens 'namespace ros1_bridge {' and the generated file closes it
 # much later, after the per-message code this check does not need.
 echo '}  // namespace ros1_bridge' >> "$WORK/stream_helpers.inc"

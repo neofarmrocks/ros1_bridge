@@ -292,9 +292,8 @@ int main(int argc, char * argv[])
         if (direction != "both" && direction != "1_to_2" && direction != "2_to_1") {
           fprintf(
             stderr,
-            "the topic '%s' has an unknown 'direction' value '%s', allowed values are 'both', "
-            "'1_to_2' and '2_to_1' - skipping it, because falling back to a bidirectional "
-            "bridge would relay the direction the configuration meant to exclude\n",
+            "the topic '%s' has an unknown 'direction' value '%s', skipped; "
+            "allowed values are 'both', '1_to_2' and '2_to_1'\n",
             topic_name.c_str(), direction.c_str());
           continue;
         }
@@ -357,14 +356,15 @@ int main(int argc, char * argv[])
       "The parameter '%s' either doesn't exist or isn't an array\n", topics_parameter_name);
   }
 
-  // Shared by both service directions (the 2->1 loop below needs it too).
+  // The 1->2 forwards wait on this budget; the 2->1 ones answer from a
+  // detached worker and have none to wait on.
   int service_execution_timeout{5};
   ros1_node.getParamCached(
     service_execution_timeout_parameter_name, service_execution_timeout);
   if (service_execution_timeout < 1) {
     fprintf(
       stderr,
-      "'%s' is %d, which would fail every service forward before it starts; using 1s\n",
+      "'%s' is %d, which would fail every 1->2 service forward before it starts; using 1s\n",
       service_execution_timeout_parameter_name, service_execution_timeout);
     service_execution_timeout = 1;
   }
@@ -479,8 +479,7 @@ int main(int argc, char * argv[])
         try {
           service_bridges_2_to_1.push_back(
             factory->service_bridge_2_to_1(
-              ros1_node, ros2_node, service_name, service_execution_timeout,
-              service_callback_group));
+              ros1_node, ros2_node, service_name, service_callback_group));
           printf("Created 2 to 1 bridge for service %s\n", service_name.c_str());
         } catch (std::runtime_error & e) {
           fprintf(
@@ -533,7 +532,6 @@ int main(int argc, char * argv[])
   async_spinner.stop();
   ros::shutdown();
   rclcpp::shutdown();
-  fflush(stdout);
-  fflush(stderr);
+  fflush(NULL);
   std::_Exit(0);
 }

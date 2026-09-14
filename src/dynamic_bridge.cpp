@@ -320,11 +320,10 @@ void update_bridge(
         "ros1", details.at("package"), details.at("name"));
       if (factory) {
         try {
-          // Upstream defaults: the 5 s budget dynamic_bridge always used, and
-          // the node's default callback group. Only parameter_bridge makes
-          // these configurable.
+          // nullptr group: upstream behaviour, the node's default one. Only
+          // parameter_bridge gives the 2->1 servers a group of their own.
           service_bridges_2_to_1[name] = factory->service_bridge_2_to_1(
-            ros1_node, ros2_node, name, 5, nullptr);
+            ros1_node, ros2_node, name, nullptr);
           printf("Created 2 to 1 bridge for service %s\n", name.data());
         } catch (std::runtime_error & e) {
           fprintf(stderr, "Failed to created a bridge: %s\n", e.what());
@@ -810,7 +809,6 @@ int main(int argc, char * argv[])
   async_spinner.stop();
   ros::shutdown();
   rclcpp::shutdown();
-  fflush(stdout);
-  fflush(stderr);
+  fflush(NULL);
   std::_Exit(0);
 }
