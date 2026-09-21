@@ -25,6 +25,7 @@
 # pragma clang diagnostic push
 # pragma clang diagnostic ignored "-Wunused-parameter"
 #endif
+#include "ros/callback_queue.h"
 #include "ros/ros.h"
 #ifdef __clang__
 # pragma clang diagnostic pop
@@ -237,6 +238,18 @@ int main(int argc, char * argv[])
   // ROS 1 node
   ros::init(argc, argv, "ros_bridge");
   ros::NodeHandle ros1_node;
+  // A second handle for the 1->2 service servers, on a callback queue of their
+  // own. forward_1_to_2 blocks its callback thread for up to
+  // service_execution_timeout while it waits on the ROS 2 future; on the
+  // node's default queue that thread is the single AsyncSpinner below, which
+  // also runs every 1->2 topic relay, so one unanswered forward (or a caller's
+  // retry loop) freezes the whole 1->2 relay set for the budget. This is the
+  // ROS 1 mirror of the reentrant callback group the 2->1 servers get on the
+  // ROS 2 side. Service clients (2->1) do not use a callback queue and keep
+  // ros1_node.
+  ros::CallbackQueue service_queue;
+  ros::NodeHandle ros1_service_node;
+  ros1_service_node.setCallbackQueue(&service_queue);
 
   // ROS 2 node
   rclcpp::init(argc, argv);
@@ -368,6 +381,19 @@ int main(int argc, char * argv[])
       service_execution_timeout_parameter_name, service_execution_timeout);
     service_execution_timeout = 1;
   }
+  // Threads for the 1->2 forwards' own queue. Each unanswered forward parks
+  // one of them for the budget above, so this bounds how many slow forwards
+  // the bridge absorbs concurrently before ROS 1 callers queue up behind each
+  // other; the topic relays are unaffected either way.
+  int service_threads{4};
+  ros1_node.getParamCached(
+    "ros1_bridge/parameter_bridge/service_threads", service_threads);
+  if (service_threads < 1) {
+    fprintf(
+      stderr,
+      "'ros1_bridge/parameter_bridge/service_threads' is %d; using 1\n", service_threads);
+    service_threads = 1;
+  }
 
   // Give the 2->1 servers a group of their own, so a slow request translation
   // cannot serialize behind the topic relays in the node's default (mutually
@@ -416,7 +442,7 @@ int main(int argc, char * argv[])
         try {
           service_bridges_1_to_2.push_back(
             factory->service_bridge_1_to_2(
-              ros1_node, ros2_node, service_name, service_execution_timeout));
+              ros1_service_node, ros2_node, service_name, service_execution_timeout));
           printf("Created 1 to 2 bridge for service %s\n", service_name.c_str());
         } catch (std::runtime_error & e) {
           fprintf(
@@ -502,9 +528,15 @@ int main(int argc, char * argv[])
       services_2_to_1_parameter_name);
   }
 
-  // ROS 1 asynchronous spinner
+  // ROS 1 asynchronous spinner (topic relays, on the node's default queue)
   ros::AsyncSpinner async_spinner(1);
   async_spinner.start();
+  // Spinner for the 1->2 service forwards (service_queue above). Not stopped
+  // explicitly at the end: a forward may still be parked in its wait_for and
+  // join() would hold the shutdown for the budget; the process leaves through
+  // std::_Exit below, as the detached 2->1 workers already require.
+  ros::AsyncSpinner service_spinner(static_cast<uint32_t>(service_threads), &service_queue);
+  service_spinner.start();
 
   // ROS 2 spinning loop
   rclcpp::executors::MultiThreadedExecutor executor;
