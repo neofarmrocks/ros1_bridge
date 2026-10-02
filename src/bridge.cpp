@@ -105,7 +105,8 @@ create_bridge_from_2_to_1(
 {
   auto factory = get_factory(ros1_type_name, ros2_type_name);
   auto ros1_pub = factory->create_ros1_publisher(
-    ros1_node, ros1_topic_name, publisher_queue_size);
+    ros1_node, ros1_topic_name, publisher_queue_size,
+    subscriber_qos.durability() == rclcpp::DurabilityPolicy::TransientLocal);
 
   auto ros2_sub = factory->create_ros2_subscriber(
     ros2_node, ros2_topic_name, subscriber_qos, ros1_pub, ros2_pub);
@@ -152,13 +153,23 @@ create_bidirectional_bridge(
   RCLCPP_INFO(
     ros2_node->get_logger(), "create bidirectional bridge for topic %s",
     topic_name.c_str());
+  // The 2->1 subscription inherits the configured reliability and durability,
+  // which is what makes a transient_local topic backfill through the bridge,
+  // but not an unbounded history: the ROS 1 republisher on the other side
+  // cannot apply backpressure, so keep_all here would let the bridge's queue
+  // grow without a limit whenever ROS 1 publishing is the slower half.
+  rclcpp::QoS subscriber_qos = publisher_qos;
+  if (subscriber_qos.history() == rclcpp::HistoryPolicy::KeepAll) {
+    subscriber_qos.keep_last(queue_size);
+  }
+
   BridgeHandles handles;
   handles.bridge1to2 = create_bridge_from_1_to_2(
     ros1_node, ros2_node,
     ros1_type_name, topic_name, queue_size, ros2_type_name, topic_name, publisher_qos);
   handles.bridge2to1 = create_bridge_from_2_to_1(
     ros2_node, ros1_node,
-    ros2_type_name, topic_name, queue_size, ros1_type_name, topic_name, queue_size,
+    ros2_type_name, topic_name, subscriber_qos, ros1_type_name, topic_name, queue_size,
     handles.bridge1to2.ros2_publisher);
   return handles;
 }

@@ -24,6 +24,7 @@
 #include "ros/subscriber.h"
 
 // include ROS 2
+#include "rclcpp/callback_group.hpp"
 #include "rclcpp/node.hpp"
 #include "rclcpp/publisher.hpp"
 #include "rclcpp/subscription.hpp"
@@ -140,8 +141,15 @@ public:
   virtual ServiceBridge1to2 service_bridge_1_to_2(
     ros::NodeHandle &, rclcpp::Node::SharedPtr, const std::string &, int) = 0;
 
+  // No timeout here, unlike 1->2: forward_2_to_1 answers from a detached
+  // worker, so nothing waits on ROS 1 for a budget to bound. The callback
+  // group keeps request translation off the node's default (mutually
+  // exclusive) group, where it would serialize with the topic relays. It is
+  // passed explicitly at every call site - a virtual default argument would
+  // resolve from the static type.
   virtual ServiceBridge2to1 service_bridge_2_to_1(
-    ros::NodeHandle &, rclcpp::Node::SharedPtr, const std::string &) = 0;
+    ros::NodeHandle &, rclcpp::Node::SharedPtr, const std::string &,
+    rclcpp::CallbackGroup::SharedPtr) = 0;
 };
 
 }  // namespace ros1_bridge

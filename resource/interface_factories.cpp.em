@@ -306,32 +306,19 @@ void ServiceFactory<
 @[      for field in service["fields"][type.lower()]]@
 @[        if field["array"]]@
   req@(to).@(field["ros" + to]["name"]).resize(req@(frm).@(field["ros" + frm]["name"]).size());
-  auto @(field["ros1"]["name"])1_it = req1.@(field["ros1"]["name"]).begin();
-  auto @(field["ros2"]["name"])2_it = req2.@(field["ros2"]["name"]).begin();
-  while (
-    @(field["ros1"]["name"])1_it != req1.@(field["ros1"]["name"]).end() &&
-    @(field["ros2"]["name"])2_it != req2.@(field["ros2"]["name"]).end()
-  ) {
-    auto & @(field["ros1"]["name"])1 = *(@(field["ros1"]["name"])1_it++);
-    auto & @(field["ros2"]["name"])2 = *(@(field["ros2"]["name"])2_it++);
-@[      else]@
-  auto & @(field["ros1"]["name"])1 = req1.@(field["ros1"]["name"]);
-  auto & @(field["ros2"]["name"])2 = req2.@(field["ros2"]["name"]);
-@[        end if]@
-@[        if field["basic"]]@
-  @(field["ros2"]["name"])@(to) = @(field["ros1"]["name"])@(frm);
-@[        else]@
-  Factory<@(field["ros1"]["cpptype"]),@(field["ros2"]["cpptype"])>::convert_@(frm)_to_@(to)(
-@[          if frm == "1"]@
-    @(field["ros1"]["name"])1, @(field["ros2"]["name"])2
+  for (size_t i = 0; i < req@(frm).@(field["ros" + frm]["name"]).size(); ++i) {
+@[          if field["basic"]]@
+    req@(to).@(field["ros" + to]["name"])[i] = req@(frm).@(field["ros" + frm]["name"])[i];
 @[          else]@
-    @(field["ros2"]["name"])2, @(field["ros1"]["name"])1
+    Factory<@(field["ros1"]["cpptype"]),@(field["ros2"]["cpptype"])>::convert_@(frm)_to_@(to)(@
+req@(frm).@(field["ros" + frm]["name"])[i], req@(to).@(field["ros" + to]["name"])[i]);
 @[          end if]@
-  );
-
-@[        end if]@
-@[        if field["array"]]@
   }
+@[        elif field["basic"]]@
+  req@(to).@(field["ros" + to]["name"]) = req@(frm).@(field["ros" + frm]["name"]);
+@[        else]@
+  Factory<@(field["ros1"]["cpptype"]),@(field["ros2"]["cpptype"])>::convert_@(frm)_to_@(to)(@
+req@(frm).@(field["ros" + frm]["name"]), req@(to).@(field["ros" + to]["name"]));
 @[        end if]@
 @[      end for]@
 }
@@ -374,9 +361,32 @@ static void streamPrimitiveVector(ros::serialization::OStream & stream, const VE
   memcpy(stream.advance(data_len), &vec.front(), data_len);
 }
 
+// This version is for write vector<bool>
+template<typename VEC_PRIMITIVE_T>
+static void streamPrimitiveVectorBool(ros::serialization::OStream & stream, const VEC_PRIMITIVE_T& vec)
+{
+  const uint32_t step = sizeof(bool);
+  const uint32_t data_len = vec.size() * sizeof(bool);
+  // advance() is what bounds-checks the buffer, so it has to run before the
+  // copy: writing through getData() first would overflow the buffer instead of
+  // throwing StreamOverrunException. Element-wise copy because of vector<bool>.
+  uint8_t * dst = stream.advance(data_len);
+  for (size_t i = 0; i < vec.size(); ++i) {
+    dst[i * step] = vec[i];
+  }
+}
+
 // This version is for length
 template<typename VEC_PRIMITIVE_T>
 static void streamPrimitiveVector(ros::serialization::LStream & stream, const VEC_PRIMITIVE_T& vec)
+{
+  const uint32_t data_len = vec.size() * sizeof(typename VEC_PRIMITIVE_T::value_type);
+  stream.advance(data_len);
+}
+
+// This version is for length
+template<typename VEC_PRIMITIVE_T>
+static void streamPrimitiveVectorBool(ros::serialization::LStream & stream, const VEC_PRIMITIVE_T& vec)
 {
   const uint32_t data_len = vec.size() * sizeof(typename VEC_PRIMITIVE_T::value_type);
   stream.advance(data_len);
@@ -389,6 +399,23 @@ static void streamPrimitiveVector(ros::serialization::IStream & stream, VEC_PRIM
   const uint32_t data_len = vec.size() * sizeof(typename VEC_PRIMITIVE_T::value_type);
   // copy data from stream into std::vector/std::array
   memcpy(&vec.front(), stream.advance(data_len), data_len);
+}
+
+// This version is for read vector<bool>
+template<typename VEC_PRIMITIVE_T>
+static void streamPrimitiveVectorBool(ros::serialization::IStream & stream, VEC_PRIMITIVE_T& vec)
+{
+  const uint32_t step = sizeof(bool);
+  const uint32_t data_len = vec.size() * sizeof(bool);
+  // advance() is what bounds-checks the read, so it has to run before the
+  // copy: vec.size() comes straight off the wire (streamVectorSize resized the
+  // vector from the message), so a truncated message would otherwise be read
+  // past the end of the receive buffer before the check ever runs.
+  // Element-wise copy because of vector<bool>.
+  const uint8_t * src = stream.advance(data_len);
+  for (size_t i = 0; i < vec.size(); ++i) {
+    vec[i] = src[i * step] != 0;
+  }
 }
 
 @[for m in mapped_msgs]@
@@ -472,6 +499,9 @@ if isinstance(ros2_fields[-1].type, NamespacedType):
   {
     ros1_bridge::internal_stream_translate_helper(stream, *ros2_it);
   }
+@[            elif ros2_fields[-1].type.value_type.typename == 'boolean']@
+  // write primitive type, specialized
+  streamPrimitiveVectorBool(stream, ros2_msg.@(ros2_field_selection));
 @[            else]@
   // write primitive type
   streamPrimitiveVector(stream, ros2_msg.@(ros2_field_selection));

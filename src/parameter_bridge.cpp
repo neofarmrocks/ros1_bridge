@@ -14,14 +14,18 @@
 
 #include <xmlrpcpp/XmlRpcException.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <list>
 #include <string>
+#include <thread>
 
 // include ROS 1
 #ifdef __clang__
 # pragma clang diagnostic push
 # pragma clang diagnostic ignored "-Wunused-parameter"
 #endif
+#include "ros/callback_queue.h"
 #include "ros/ros.h"
 #ifdef __clang__
 # pragma clang diagnostic pop
@@ -234,12 +238,26 @@ int main(int argc, char * argv[])
   // ROS 1 node
   ros::init(argc, argv, "ros_bridge");
   ros::NodeHandle ros1_node;
+  // A second handle for the 1->2 service servers, on a callback queue of their
+  // own. forward_1_to_2 blocks its callback thread for up to
+  // service_execution_timeout while it waits on the ROS 2 future; on the
+  // node's default queue that thread is the single AsyncSpinner below, which
+  // also runs every 1->2 topic relay, so one unanswered forward (or a caller's
+  // retry loop) freezes the whole 1->2 relay set for the budget. This is the
+  // ROS 1 mirror of the reentrant callback group the 2->1 servers get on the
+  // ROS 2 side. Service clients (2->1) do not use a callback queue and keep
+  // ros1_node.
+  ros::CallbackQueue service_queue;
+  ros::NodeHandle ros1_service_node;
+  ros1_service_node.setCallbackQueue(&service_queue);
 
   // ROS 2 node
   rclcpp::init(argc, argv);
   auto ros2_node = rclcpp::Node::make_shared("ros_bridge");
 
   std::list<ros1_bridge::BridgeHandles> all_handles;
+  std::list<ros1_bridge::Bridge1to2Handles> all_handles_1_to_2;
+  std::list<ros1_bridge::Bridge2to1Handles> all_handles_2_to_1;
   std::list<ros1_bridge::ServiceBridge1to2> service_bridges_1_to_2;
   std::list<ros1_bridge::ServiceBridge2to1> service_bridges_2_to_1;
 
@@ -281,13 +299,51 @@ int main(int argc, char * argv[])
       if (!queue_size) {
         queue_size = 100;
       }
+      std::string direction = "both";
+      if (topics[i].hasMember("direction")) {
+        direction = static_cast<std::string>(topics[i]["direction"]);
+        if (direction != "both" && direction != "1_to_2" && direction != "2_to_1") {
+          fprintf(
+            stderr,
+            "the topic '%s' has an unknown 'direction' value '%s', skipped; "
+            "allowed values are 'both', '1_to_2' and '2_to_1'\n",
+            topic_name.c_str(), direction.c_str());
+          continue;
+        }
+      }
       printf(
-        "Trying to create bidirectional bridge for topic '%s' "
+        "Trying to create [%s] bridge for topic '%s' "
         "with ROS 2 type '%s'\n",
-        topic_name.c_str(), type_name.c_str());
+        direction.c_str(), topic_name.c_str(), type_name.c_str());
 
       try {
-        if (topics[i].hasMember("qos")) {
+        if (direction == "2_to_1") {
+          if (topics[i].hasMember("qos")) {
+            printf("Setting up QoS for '%s': ", topic_name.c_str());
+            auto qos_settings = qos_from_params(topics[i]["qos"]);
+            printf("\n");
+            all_handles_2_to_1.push_back(ros1_bridge::create_bridge_from_2_to_1(
+                ros2_node, ros1_node, type_name, topic_name, qos_settings,
+                "", topic_name, queue_size));
+          } else {
+            all_handles_2_to_1.push_back(ros1_bridge::create_bridge_from_2_to_1(
+                ros2_node, ros1_node, type_name, topic_name, queue_size,
+                "", topic_name, queue_size));
+          }
+        } else if (direction == "1_to_2") {
+          if (topics[i].hasMember("qos")) {
+            printf("Setting up QoS for '%s': ", topic_name.c_str());
+            auto qos_settings = qos_from_params(topics[i]["qos"]);
+            printf("\n");
+            all_handles_1_to_2.push_back(ros1_bridge::create_bridge_from_1_to_2(
+                ros1_node, ros2_node, "", topic_name, queue_size,
+                type_name, topic_name, qos_settings));
+          } else {
+            all_handles_1_to_2.push_back(ros1_bridge::create_bridge_from_1_to_2(
+                ros1_node, ros2_node, "", topic_name, queue_size,
+                type_name, topic_name, queue_size));
+          }
+        } else if (topics[i].hasMember("qos")) {
           printf("Setting up QoS for '%s': ", topic_name.c_str());
           auto qos_settings = qos_from_params(topics[i]["qos"]);
           printf("\n");
@@ -302,9 +358,9 @@ int main(int argc, char * argv[])
       } catch (std::runtime_error & e) {
         fprintf(
           stderr,
-          "failed to create bidirectional bridge for topic '%s' "
+          "failed to create [%s] bridge for topic '%s' "
           "with ROS 2 type '%s': %s\n",
-          topic_name.c_str(), type_name.c_str(), e.what());
+          direction.c_str(), topic_name.c_str(), type_name.c_str(), e.what());
       }
     }
   } else {
@@ -313,15 +369,46 @@ int main(int argc, char * argv[])
       "The parameter '%s' either doesn't exist or isn't an array\n", topics_parameter_name);
   }
 
+  // The 1->2 forwards wait on this budget; the 2->1 ones answer from a
+  // detached worker and have none to wait on.
+  int service_execution_timeout{5};
+  ros1_node.getParamCached(
+    service_execution_timeout_parameter_name, service_execution_timeout);
+  if (service_execution_timeout < 1) {
+    fprintf(
+      stderr,
+      "'%s' is %d, which would fail every 1->2 service forward before it starts; using 1s\n",
+      service_execution_timeout_parameter_name, service_execution_timeout);
+    service_execution_timeout = 1;
+  }
+  // Threads for the 1->2 forwards' own queue. Each unanswered forward parks
+  // one of them for the budget above, so this bounds how many slow forwards
+  // the bridge absorbs concurrently before ROS 1 callers queue up behind each
+  // other; the topic relays are unaffected either way.
+  int service_threads{4};
+  ros1_node.getParamCached(
+    "ros1_bridge/parameter_bridge/service_threads", service_threads);
+  if (service_threads < 1) {
+    fprintf(
+      stderr,
+      "'ros1_bridge/parameter_bridge/service_threads' is %d; using 1\n", service_threads);
+    service_threads = 1;
+  }
+
+  // Give the 2->1 servers a group of their own, so a slow request translation
+  // cannot serialize behind the topic relays in the node's default (mutually
+  // exclusive) group. The blocking part of the forward -- roscpp's untimed
+  // client.call() -- is already off the executor entirely (see
+  // ServiceFactory::forward_2_to_1); this is the second line of defence.
+  auto service_callback_group = ros2_node->create_callback_group(
+    rclcpp::CallbackGroupType::Reentrant);
+
   // ROS 1 Services in ROS 2
   XmlRpc::XmlRpcValue services_1_to_2;
   if (
     ros1_node.getParam(services_1_to_2_parameter_name, services_1_to_2) &&
     services_1_to_2.getType() == XmlRpc::XmlRpcValue::TypeArray)
   {
-    int service_execution_timeout{5};
-    ros1_node.getParamCached(
-      service_execution_timeout_parameter_name, service_execution_timeout);
     for (size_t i = 0; i < static_cast<size_t>(services_1_to_2.size()); ++i) {
       std::string service_name = static_cast<std::string>(services_1_to_2[i]["service"]);
       std::string type_name = static_cast<std::string>(services_1_to_2[i]["type"]);
@@ -355,7 +442,7 @@ int main(int argc, char * argv[])
         try {
           service_bridges_1_to_2.push_back(
             factory->service_bridge_1_to_2(
-              ros1_node, ros2_node, service_name, service_execution_timeout));
+              ros1_service_node, ros2_node, service_name, service_execution_timeout));
           printf("Created 1 to 2 bridge for service %s\n", service_name.c_str());
         } catch (std::runtime_error & e) {
           fprintf(
@@ -417,7 +504,8 @@ int main(int argc, char * argv[])
       if (factory) {
         try {
           service_bridges_2_to_1.push_back(
-            factory->service_bridge_2_to_1(ros1_node, ros2_node, service_name));
+            factory->service_bridge_2_to_1(
+              ros1_node, ros2_node, service_name, service_callback_group));
           printf("Created 2 to 1 bridge for service %s\n", service_name.c_str());
         } catch (std::runtime_error & e) {
           fprintf(
@@ -440,15 +528,42 @@ int main(int argc, char * argv[])
       services_2_to_1_parameter_name);
   }
 
-  // ROS 1 asynchronous spinner
+  // ROS 1 asynchronous spinner (topic relays, on the node's default queue)
   ros::AsyncSpinner async_spinner(1);
   async_spinner.start();
+  // Spinner for the 1->2 service forwards (service_queue above). Not stopped
+  // explicitly at the end: a forward may still be parked in its wait_for and
+  // join() would hold the shutdown for the budget; the process leaves through
+  // std::_Exit below, as the detached 2->1 workers already require.
+  ros::AsyncSpinner service_spinner(static_cast<uint32_t>(service_threads), &service_queue);
+  service_spinner.start();
 
   // ROS 2 spinning loop
-  rclcpp::executors::SingleThreadedExecutor executor;
-  while (ros1_node.ok() && rclcpp::ok()) {
-    executor.spin_node_once(ros2_node, std::chrono::milliseconds(1000));
-  }
+  rclcpp::executors::MultiThreadedExecutor executor;
+  executor.add_node(ros2_node);
+  std::thread ros1_watchdog([&executor, &ros1_node]() {
+      while (ros1_node.ok() && rclcpp::ok()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      }
+      executor.cancel();
+    });
+  // The watchdog above is the only way out: spin() blocks on an idle wait set,
+  // so it has to be cancel()ed rather than polled. Nothing is caught around it
+  // on purpose - a MultiThreadedExecutor runs callbacks on worker threads,
+  // where an escaping exception is std::terminate before any catch here could
+  // see it. Failures in the forwards are contained where they happen instead.
+  executor.spin();
+  ros1_watchdog.join();
 
-  return 0;
+  // A 2->1 forward worker can still be parked inside roscpp's client.call(),
+  // which cannot be cancelled. Dropping the ROS 1 connections releases the
+  // ones whose peer is only slow; the rest are left where they are and the
+  // process leaves without running static destruction, because a worker still
+  // inside call() would otherwise be using roscpp singletons as they are torn
+  // down under it.
+  async_spinner.stop();
+  ros::shutdown();
+  rclcpp::shutdown();
+  fflush(NULL);
+  std::_Exit(0);
 }

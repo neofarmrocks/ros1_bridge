@@ -16,7 +16,9 @@
 #define  ROS1_BRIDGE__FACTORY_HPP_
 
 #include <functional>
+#include <future>
 #include <memory>
+#include <thread>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,6 +28,7 @@
 
 // include ROS 1 message event
 #include "ros/message.h"
+#include "ros/this_node.h"
 
 #include "rcutils/logging_macros.h"
 
@@ -45,7 +48,7 @@ public:
   {
     ts_lib_ = rclcpp::get_typesupport_library(ros2_type_name, "rosidl_typesupport_cpp");
     if (static_cast<bool>(ts_lib_)) {
-      type_support_ = rclcpp::get_typesupport_handle(
+      type_support_ = rclcpp::get_message_typesupport_handle(
         ros2_type_name, "rosidl_typesupport_cpp",
         *ts_lib_);
     }
@@ -200,7 +203,7 @@ protected:
 
     std::string key = "callerid";
     if (connection_header->find(key) != connection_header->end()) {
-      if (connection_header->at(key) == "/ros_bridge") {
+      if (connection_header->at(key) == ros::this_node::getName()) {
         return;
       }
     }
@@ -400,20 +403,48 @@ public:
   using ROS1Response = typename ROS1_T::Response;
   using ROS2Response = typename ROS2_T::Response;
 
-  void forward_2_to_1(
-    ros::ServiceClient client, rclcpp::Logger logger, const std::shared_ptr<rmw_request_id_t>,
-    const std::shared_ptr<ROS2Request> request, std::shared_ptr<ROS2Response> response)
+  // Deferred-response forward. Two things make this shape the only one that
+  // works: roscpp's client.call() blocks with no deadline, so it must not run
+  // on an executor thread at all (a rospy node waiting on sim time never
+  // answers while /clock is missing, and would park that thread forever), and
+  // rclcpp only withholds a reply for the callback forms that return none --
+  // returning a response object and reporting failure by exception would send
+  // a default-constructed reply instead, success=false with no message, or
+  // empty data that reads as a successful empty answer.
+  //
+  // So: park the call on a detached worker that sends the response itself, and
+  // return immediately, so the relay callbacks keep their threads no matter how
+  // many forwards are outstanding. A ROS 1 failure sends nothing, which is the
+  // timeout the callers already handle.
+  //
+  // Ceiling: one parked thread per call that ROS 1 never answers, because the
+  // call cannot be cancelled. Bounded in practice by the retry rate of the
+  // callers (seconds apart); a roscpp-level cancel or a bounded worker pool is
+  // the upgrade path. main() must not run static destruction while one of these
+  // is still inside client.call() -- see parameter_bridge.cpp.
+  static void forward_2_to_1(
+    ros::ServiceClient client, rclcpp::Logger logger,
+    std::shared_ptr<rmw_request_id_t> request_id,
+    const std::shared_ptr<ROS2Request> request,
+    std::shared_ptr<rclcpp::Service<ROS2_T>> service)
   {
-    ROS1_T srv;
-    translate_2_to_1(*request, srv.request);
-    if (client.call(srv)) {
-      translate_1_to_2(srv.response, *response);
-    } else {
-      throw std::runtime_error("Failed to get response from ROS 1 service " + client.getService());
-    }
+    auto srv = std::make_shared<ROS1_T>();
+    translate_2_to_1(*request, srv->request);
+    std::thread(
+      [client, srv, logger, service, request_id]() mutable {
+        if (!client.call(*srv)) {
+          RCLCPP_ERROR(
+            logger, "Failed to get response from ROS 1 service %s, request left unanswered",
+            client.getService().c_str());
+          return;
+        }
+        auto response = std::make_shared<ROS2Response>();
+        translate_1_to_2(srv->response, *response);
+        service->send_response(*request_id, *response);
+      }).detach();
   }
 
-  bool forward_1_to_2(
+  static bool forward_1_to_2(
     rclcpp::ClientBase::SharedPtr cli, rclcpp::Logger logger,
     const ROS1Request & request1, ROS1Response & response1,
     int service_execution_timeout)
@@ -455,36 +486,49 @@ public:
     ServiceBridge1to2 bridge;
     bridge.client = ros2_node->create_client<ROS2_T>(name);
     auto m = &ServiceFactory<ROS1_T, ROS2_T>::forward_1_to_2;
+    // Bound without `this`: the factory is a unique_ptr the callers drop right
+    // after they build the bridge, while these callbacks outlive it.
     auto f = std::bind(
-      m, this, bridge.client, ros2_node->get_logger(), std::placeholders::_1,
+      m, bridge.client, ros2_node->get_logger(), std::placeholders::_1,
       std::placeholders::_2, service_execution_timeout);
     bridge.server = ros1_node.advertiseService<ROS1Request, ROS1Response>(name, f);
     return bridge;
   }
 
   ServiceBridge2to1 service_bridge_2_to_1(
-    ros::NodeHandle & ros1_node, rclcpp::Node::SharedPtr ros2_node, const std::string & name)
+    ros::NodeHandle & ros1_node, rclcpp::Node::SharedPtr ros2_node, const std::string & name,
+    rclcpp::CallbackGroup::SharedPtr group)
   {
     ServiceBridge2to1 bridge;
     bridge.client = ros1_node.serviceClient<ROS1_T>(name);
-    auto m = &ServiceFactory<ROS1_T, ROS2_T>::forward_2_to_1;
+    // This is the callback form that hands over the service handle, which is
+    // what the worker needs to answer with.
+    auto logger = ros2_node->get_logger();
+    auto client = bridge.client;
     std::function<
       void(
-        const std::shared_ptr<rmw_request_id_t>,
-        const std::shared_ptr<ROS2Request>,
-        std::shared_ptr<ROS2Response>)> f;
-    f = std::bind(
-      m, this, bridge.client, ros2_node->get_logger(), std::placeholders::_1,
-      std::placeholders::_2, std::placeholders::_3);
-    bridge.server = ros2_node->create_service<ROS2_T>(name, f);
+        std::shared_ptr<rclcpp::Service<ROS2_T>>,
+        std::shared_ptr<rmw_request_id_t>,
+        std::shared_ptr<ROS2Request>)> f =
+      [client, logger](
+      std::shared_ptr<rclcpp::Service<ROS2_T>> service,
+      std::shared_ptr<rmw_request_id_t> request_id,
+      std::shared_ptr<ROS2Request> request) {
+        forward_2_to_1(client, logger, request_id, request, service);
+      };
+    bridge.server = ros2_node->create_service<ROS2_T>(
+      name, f, rclcpp::ServicesQoS(), group);
     return bridge;
   }
 
 private:
-  void translate_1_to_2(const ROS1Request &, ROS2Request &);
-  void translate_1_to_2(const ROS1Response &, ROS2Response &);
-  void translate_2_to_1(const ROS2Request &, ROS1Request &);
-  void translate_2_to_1(const ROS2Response &, ROS1Response &);
+  // Static: the generated specializations are pure field copies, and the
+  // callbacks that use them outlive the factory object (the callers drop the
+  // unique_ptr returned by get_service_factory() as soon as the bridge exists).
+  static void translate_1_to_2(const ROS1Request &, ROS2Request &);
+  static void translate_1_to_2(const ROS1Response &, ROS2Response &);
+  static void translate_2_to_1(const ROS2Request &, ROS1Request &);
+  static void translate_2_to_1(const ROS2Response &, ROS1Response &);
 };
 
 }  // namespace ros1_bridge

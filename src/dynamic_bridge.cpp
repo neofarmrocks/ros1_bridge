@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -318,7 +320,10 @@ void update_bridge(
         "ros1", details.at("package"), details.at("name"));
       if (factory) {
         try {
-          service_bridges_2_to_1[name] = factory->service_bridge_2_to_1(ros1_node, ros2_node, name);
+          // nullptr group: upstream behaviour, the node's default one. Only
+          // parameter_bridge gives the 2->1 servers a group of their own.
+          service_bridges_2_to_1[name] = factory->service_bridge_2_to_1(
+            ros1_node, ros2_node, name, nullptr);
           printf("Created 2 to 1 bridge for service %s\n", name.data());
         } catch (std::runtime_error & e) {
           fprintf(stderr, "Failed to created a bridge: %s\n", e.what());
@@ -798,5 +803,12 @@ int main(int argc, char * argv[])
     executor.spin_node_once(ros2_node);
   }
 
-  return 0;
+  // A 2->1 forward worker can still be parked inside roscpp's client.call(),
+  // which cannot be cancelled, so drop the ROS 1 connections and leave without
+  // running static destruction underneath it (see parameter_bridge.cpp).
+  async_spinner.stop();
+  ros::shutdown();
+  rclcpp::shutdown();
+  fflush(NULL);
+  std::_Exit(0);
 }
